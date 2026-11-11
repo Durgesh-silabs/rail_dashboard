@@ -1,0 +1,35 @@
+# RAIL dashboard refresh settings.
+
+dashboard_excel: C:/Users/ada/OneDrive - Silicon Laboratories Inc/Triage/RAIL-dashboard.xlsx
+# Smoke keeps last 5 builds; other test types keep the latest Triage Complete only.
+dashboard_smoke_excel: C:/Users/ada/OneDrive - Silicon Laboratories Inc/Triage/RAIL-dashboard-smoke.xlsx
+dashboard_root: https://jenkins-cbs-sqa.silabs.net/job/2026.12-package-manager-sqa-pipelines/
+dashboard_stacks:
+  - rail
+  - rail_sdk
+dashboard_test_types:
+  - smoke
+  - ext_smoke
+  - regression
+  - ext_regression
+dashboard_sources:
+  - label: Pkg manager
+    root: https://jenkins-cbs-sqa.silabs.net/job/2026.12-package-manager-sqa-pipelines/
+    stacks:
+      - rail
+      - rail_sdk
+    test_types:
+      - smoke
+      - ext_smoke
+      - regression
+      - ext_regression
+    iot_report: 6a8888517452450001d72c31
+  - label: "2026.12"
+    jobs:
+      - stack: rail
+        test_type: smoke
+        url: https://jenkins-cbs-sqa.silabs.net/job/sqa-pipelines-rail/job/sisdk-2026.12%252Fsmoke%252Futf%252Ftimed%252Frail/
+      - stack: rail_sdk
+        test_type: smoke
+        url: https://jenkins-cbs-sqa.silabs.net/job/sqa-pipelines-rail/job/sisdk-2026.12%252Fsmoke%252Futf%252Ftimed%252Frail_sdk/
+    iot_report: 6a8888517452450001d72c30
