@@ -12,15 +12,16 @@ from .config import DashboardSource
 from .jenkins_client import JenkinsClient, JenkinsError, api_json_url
 from .dashboard_excel import (
     HISTORY_LIMIT,
+    WEEKLY_SCHEDULED_TYPES,
+    WEEKLY_SCHEDULED_WINDOW,
     DashboardRun,
+    include_run_for_dashboard,
     iso_date_from_ms,
-    load_dashboard_runs,
     match_test_type,
     summarize_skip_reasons,
     write_dashboard,
-    write_smoke_mix_dashboard,
 )
-from .iot_triage import apply_iot_triage
+from .iot_triage import COMPLETE, apply_iot_triage
 
 
 @dataclass
@@ -315,6 +316,7 @@ def collect_recent_runs(
     test_type: str,
     limit: int = HISTORY_LIMIT,
     window: int = 80,
+    weekly_schedule: bool = False,
 ) -> list[DashboardRun]:
     """Last distinct SDK builds that published a test report, newest first."""
     job = job_url if job_url.endswith("/") else job_url + "/"
@@ -329,6 +331,14 @@ def collect_recent_runs(
             continue
         number = int(build["number"])
         build_url = f"{job}{number}/"
+        triggered = _triggered_on(client, build_url, build.get("timestamp"))
+        if not include_run_for_dashboard(
+            test_type,
+            triggered,
+            build.get("timestamp"),
+            weekly_schedule=weekly_schedule,
+        ):
+            continue
         sdk = _sdk_number(client, build_url)
         if not sdk or sdk in seen:
             continue
@@ -354,7 +364,7 @@ def collect_recent_runs(
                 jenkins_run=number,
                 release=release,
                 jenkins_url=build_url,
-                triggered=_triggered_on(client, build_url, build.get("timestamp")),
+                triggered=triggered,
                 skip_reason=summarize_skip_reasons(_skip_messages(client, build_url))
                 if skip
                 else "",
@@ -408,34 +418,57 @@ def match_source(
     return None
 
 
-def refresh_dashboard(config) -> Path:
-    """Pull recent Jenkins results into the same dashboard workbook."""
-    if not config.dashboard_excel:
-        raise JenkinsError("dashboard_excel is not set")
-    sources = config.resolved_dashboard_sources()
-    if not sources:
+def _collect_runs(
+    config, *, limit: int = HISTORY_LIMIT, weekly_schedule: bool = False
+) -> list[DashboardRun]:
+    if not config.resolved_dashboard_sources():
         raise JenkinsError("No dashboard sources are configured")
     client = JenkinsClient()
     runs: list[DashboardRun] = []
-    for source in sources:
+    for source in config.resolved_dashboard_sources():
         source_runs: list[DashboardRun] = []
         for job_url, stack, test_type in _source_jobs(client, source):
             print(f"Fetching {source.label} / {stack} / {test_type}", flush=True)
+            reg_window = (
+                WEEKLY_SCHEDULED_WINDOW
+                if weekly_schedule and test_type in WEEKLY_SCHEDULED_TYPES
+                else 80
+            )
             found = collect_recent_runs(
                 client,
                 job_url,
                 release=source.label,
                 stack=stack,
                 test_type=test_type,
+                limit=limit,
+                window=reg_window,
+                weekly_schedule=weekly_schedule,
             )
             print(f"  {len(found)} build(s)", flush=True)
             source_runs.extend(found)
         if source.iot_report:
             apply_iot_triage(source_runs, source.iot_report)
         runs.extend(source_runs)
-    path = write_dashboard(Path(config.dashboard_excel), runs)
-    smoke_path = getattr(config, "dashboard_smoke_excel", None)
-    if smoke_path:
-        write_smoke_mix_dashboard(Path(smoke_path), load_dashboard_runs(path))
-        print(f"Smoke workbook: {smoke_path}", flush=True)
-    return path
+    return runs
+
+
+def refresh_dashboard(config) -> Path:
+    """Pull recent Jenkins results into the daily dashboard workbook."""
+    if not config.dashboard_excel:
+        raise JenkinsError("dashboard_excel is not set")
+    runs = _collect_runs(config)
+    return write_dashboard(Path(config.dashboard_excel), runs)
+
+
+def refresh_dashboard_weekly(config) -> Path:
+    """Write the weekly workbook: Triage Complete builds only, five per section."""
+    weekly = getattr(config, "dashboard_weekly_excel", None)
+    if not weekly:
+        raise JenkinsError("dashboard_weekly_excel is not set")
+    # Fetch like daily; pipeline + backfill filtering happens in write_dashboard.
+    runs = _collect_runs(config, limit=50, weekly_schedule=False)
+    triage_complete = sum(1 for run in runs if str(run.status or "").strip() == COMPLETE)
+    print(f"  Triage Complete rows: {triage_complete}", flush=True)
+    return write_dashboard(
+        Path(weekly), runs, completed_only=True, report_week=config.report_week
+    )

@@ -19,12 +19,36 @@ from openpyxl.utils import get_column_letter
 from openpyxl.workbook.workbook import Workbook as WorkbookType
 from openpyxl.worksheet.worksheet import Worksheet
 
+from .report_week import (
+    ReportWeekConfig,
+    format_report_week,
+    report_week_start,
+    report_week_start_for_triggered,
+)
+
 
 DASHBOARD_SHEET = "Dashboard"
 HISTORY_SHEET = "History"
 HISTORY_LIMIT = 5
 
 TEST_TYPES = ("smoke", "ext_smoke", "regression", "ext_regression")
+# Weekly workbook only: one row per scheduled pipeline day (local Jenkins start time).
+WEEKLY_SCHEDULED_TYPES = frozenset({"regression", "ext_smoke", "ext_regression"})
+WEEKLY_SCHEDULED_WINDOW = 400
+# Mon-Fri team triages the scheduled run; Jenkins dates can spill across the weekend.
+WEEKLY_PIPELINE_WEEKDAYS: dict[str, frozenset[int]] = {
+    "regression": frozenset({6, 0}),
+    "ext_smoke": frozenset({3, 4, 5, 6, 0}),
+    "ext_regression": frozenset({4, 5, 6, 0}),
+}
+WEEKLY_PIPELINE_PRIMARY_DAY: dict[str, int] = {
+    "regression": 6,
+    "ext_smoke": 3,
+    "ext_regression": 4,
+}
+# Weekly meeting view: smoke = one row per Wed–Wed week; scheduled types = last N complete.
+WEEKLY_SCHEDULED_COMPLETE_LIMIT = 3
+WEEKLY_SMOKE_REPORT_WEEKS = frozenset({"smoke"})
 STACKS = ("rail", "rail_sdk")
 STACK_LABELS = {"rail": "RAIL", "rail_sdk": "RAIL SDK"}
 PKG_MANAGER = "Pkg manager"
@@ -233,6 +257,59 @@ def iso_date_from_ms(value: Any) -> str:
     if millis <= 0:
         return ""
     return datetime.fromtimestamp(millis / 1000).strftime("%Y-%m-%d")
+
+
+def run_weekday(triggered: str, timestamp: object = None) -> int | None:
+    """Local weekday for a Jenkins start time (Monday=0, Sunday=6)."""
+    text = str(triggered or "").strip()[:10]
+    if text:
+        try:
+            return datetime.strptime(text, "%Y-%m-%d").weekday()
+        except ValueError:
+            pass
+    try:
+        millis = int(timestamp)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if millis <= 0:
+        return None
+    return datetime.fromtimestamp(millis / 1000).weekday()
+
+
+def _matches_weekly_pipeline_day(test_type: str, weekday: int | None) -> bool:
+    """Local Jenkins start weekday allowed for the weekly workbook."""
+    if weekday is None:
+        return True
+    allowed = WEEKLY_PIPELINE_WEEKDAYS.get(test_type)
+    if allowed is None:
+        return True
+    return weekday in allowed
+
+
+def include_run_for_dashboard(
+    test_type: str,
+    triggered: str,
+    timestamp: object = None,
+    *,
+    weekly_schedule: bool = False,
+) -> bool:
+    """Apply pipeline weekday rules on the weekly workbook only."""
+    if not weekly_schedule or test_type not in WEEKLY_SCHEDULED_TYPES:
+        return True
+    return _matches_weekly_pipeline_day(test_type, run_weekday(triggered, timestamp))
+
+
+def _weekly_run_rank(run: DashboardRun) -> tuple[int, ...]:
+    """Prefer the scheduled pipeline run when Jenkins has multiple runs for one SDK."""
+    weekday = run_weekday(run.triggered)
+    test_type = run.test_type
+    allowed = WEEKLY_PIPELINE_WEEKDAYS.get(test_type)
+    if not allowed:
+        return (1, run.jenkins_run)
+    on_window = weekday in allowed if weekday is not None else True
+    primary = WEEKLY_PIPELINE_PRIMARY_DAY.get(test_type)
+    on_primary = int(weekday == primary) if primary is not None and weekday is not None else 0
+    return (int(on_window), on_primary, run.jenkins_run)
 
 
 def _excel_date(value: str):
@@ -463,26 +540,46 @@ def _apply_default_confidence(grouped: dict[tuple[str, str, str], list[Dashboard
                 run.confidence = default
 
 
-def _merge(existing: list[DashboardRun], incoming: list[DashboardRun]) -> list[DashboardRun]:
+def _prefer_run(
+    current: DashboardRun,
+    other: DashboardRun,
+    *,
+    weekly_schedule: bool = False,
+) -> DashboardRun:
+    """On the weekly workbook, keep the pipeline-scheduled Jenkins run for a given SDK."""
+    if weekly_schedule and (
+        current.test_type in WEEKLY_SCHEDULED_TYPES
+        or other.test_type in WEEKLY_SCHEDULED_TYPES
+    ):
+        return (
+            current
+            if _weekly_run_rank(current) >= _weekly_run_rank(other)
+            else other
+        )
+    return current if current.jenkins_run >= other.jenkins_run else other
+
+
+def _merge(
+    existing: list[DashboardRun],
+    incoming: list[DashboardRun],
+    *,
+    limit: int = HISTORY_LIMIT,
+    weekly_schedule: bool = False,
+) -> list[DashboardRun]:
     by_key = {run.key: run for run in existing}
     for run in incoming:
         prev = by_key.get(run.key)
         if prev is None:
             by_key[run.key] = run
             continue
-        if run.jenkins_run >= prev.jenkins_run:
-            _keep_manual(run, prev)
-            if not run.jenkins_url:
-                run.jenkins_url = prev.jenkins_url
-            if not run.triggered:
-                run.triggered = prev.triggered
-            by_key[run.key] = run
-        else:
-            _keep_manual(prev, run)
-            if not prev.jenkins_url:
-                prev.jenkins_url = run.jenkins_url
-            if not prev.triggered:
-                prev.triggered = run.triggered
+        winner = _prefer_run(run, prev, weekly_schedule=weekly_schedule)
+        loser = prev if winner is run else run
+        _keep_manual(winner, loser)
+        if not winner.jenkins_url:
+            winner.jenkins_url = loser.jenkins_url
+        if not winner.triggered:
+            winner.triggered = loser.triggered
+        by_key[run.key] = winner
     grouped: dict[tuple[str, str, str], list[DashboardRun]] = {}
     for run in by_key.values():
         # Pkg manager RAIL smoke 1269 published only the app-build list.
@@ -499,7 +596,7 @@ def _merge(existing: list[DashboardRun], incoming: list[DashboardRun]) -> list[D
     kept: list[DashboardRun] = []
     for group in grouped.values():
         group.sort(key=lambda r: (r.jenkins_run, _sdk_value(r)), reverse=True)
-        kept.extend(group[:HISTORY_LIMIT])
+        kept.extend(group[:limit])
     return kept
 
 
@@ -678,18 +775,34 @@ def _link_test_type(ws: Worksheet, row: int, test_type: str) -> None:
     type_cell.font = Font(color="1F4E79", underline="single")
 
 
-def _write_main(wb: Workbook, runs: list[DashboardRun]) -> dict[tuple[str, str, str], str]:
+def _write_main(
+    wb: Workbook,
+    runs: list[DashboardRun],
+    *,
+    completed_only: bool = False,
+    report_week: ReportWeekConfig | None = None,
+) -> dict[tuple[str, str, str], str]:
     """Write the main sheet and return Triage owner cells by release, stack, and test type."""
     ws = wb.create_sheet(DASHBOARD_SHEET, 0)
     ws.sheet_properties.tabColor = "1F4E79"
     ws["A1"] = "RAIL dashboard"
     ws["A1"].font = _TITLE_FONT
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(MAIN_HEADERS))
-    ws["A2"] = (
-        "This page shows the latest build whose triage is complete. "
-        "Type the yellow cells here. Triage status follows the IoT report. "
-        "Triage owner on the other sheets follows this page."
-    )
+    if completed_only:
+        cfg = report_week or ReportWeekConfig()
+        span = format_report_week(report_week_start(cfg=cfg), cfg)
+        ws["A2"] = (
+            f"Weekly meeting view: Triage Complete only (no incomplete / not run). "
+            f"Report weeks Wed–Wed, ending {cfg.label()}. Active week: {span}. "
+            f"Smoke: one complete row per report week. "
+            f"Regression / ext_smoke / ext_regression: last {WEEKLY_SCHEDULED_COMPLETE_LIMIT} complete triages."
+        )
+    else:
+        ws["A2"] = (
+            "This page shows the latest build whose triage is complete. "
+            "Type the yellow cells here. Triage status follows the IoT report. "
+            "Triage owner on the other sheets follows this page."
+        )
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(MAIN_HEADERS))
     ws["A2"].font = Font(color="667085")
 
@@ -706,7 +819,13 @@ def _write_main(wb: Workbook, runs: list[DashboardRun]) -> dict[tuple[str, str, 
         for test_type in section.test_types:
             ordered = _ordered(runs, section.release, section.stack, test_type)
             completed = [run for run in ordered if _is_complete(run)]
-            if not ordered:
+            if completed_only:
+                if not completed:
+                    continue
+                shown = completed[0]
+                older = completed[1] if len(completed) > 1 else None
+                metrics = _metric_map(shown, older)
+            elif not ordered:
                 _write_not_run(ws, row, MAIN_HEADERS)
                 _link_test_type(ws, row, test_type)
                 owner_col = MAIN_HEADERS.index("Triage owner") + 1
@@ -715,11 +834,12 @@ def _write_main(wb: Workbook, runs: list[DashboardRun]) -> dict[tuple[str, str, 
                 ).coordinate
                 row += 1
                 continue
-            shown = completed[0] if completed else None
-            older = completed[1] if len(completed) > 1 else None
-            metrics = _metric_map(shown, older) if shown is not None else {}
-            if shown is None:
-                metrics = {"Triage owner": _named_owner(ordered)}
+            else:
+                shown = completed[0] if completed else None
+                older = completed[1] if len(completed) > 1 else None
+                metrics = _metric_map(shown, older) if shown is not None else {}
+                if shown is None:
+                    metrics = {"Triage owner": _named_owner(ordered)}
             fail_delta = metrics.get("_fail_delta")
             for col, header in enumerate(MAIN_HEADERS, start=1):
                 value = test_type if header == "Test type" else metrics.get(header)
@@ -755,16 +875,36 @@ def _write_progress(
     runs: list[DashboardRun],
     test_type: str,
     owner_cells: dict[tuple[str, str, str], str],
+    *,
+    completed_only: bool = False,
 ) -> None:
     ws = wb.create_sheet(test_type)
     ws.sheet_properties.tabColor = "5B7C99"
     ws["A1"] = test_type
     ws["A1"].font = _TITLE_FONT
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(PROGRESS_HEADERS))
-    ws["A2"] = (
-        "The blue row is the latest build, including triage that is still open. "
-        "Build number opens the Jenkins run."
-    )
+    if completed_only:
+        if test_type in WEEKLY_SCHEDULED_TYPES:
+            schedule = {
+                "regression": "Sunday pipeline (Mon spill; not Tue)",
+                "ext_smoke": "Thursday pipeline (through Mon)",
+                "ext_regression": "Friday pipeline (Mon spill)",
+            }.get(test_type, test_type)
+            ws["A2"] = (
+                f"Last {WEEKLY_SCHEDULED_COMPLETE_LIMIT} Triage Complete builds ({schedule}), "
+                "newest at the top. Fills with other recent completes if fewer pipeline rows. "
+                "Build number opens the Jenkins run."
+            )
+        else:
+            ws["A2"] = (
+                "One Triage Complete smoke per Wed–Wed report week "
+                "(five weeks), latest at the top. Build number opens the Jenkins run."
+            )
+    else:
+        ws["A2"] = (
+            "The blue row is the latest build, including triage that is still open. "
+            "Build number opens the Jenkins run."
+        )
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(PROGRESS_HEADERS))
     ws["A2"].font = Font(color="667085")
 
@@ -784,8 +924,9 @@ def _write_progress(
         ordered = _ordered(runs, section.release, section.stack, test_type)
         owner_ref = owner_cells.get((section.release, section.stack, test_type), "")
         if not ordered:
-            _write_not_run(ws, row, PROGRESS_HEADERS)
-            row += 2
+            if not completed_only:
+                _write_not_run(ws, row, PROGRESS_HEADERS)
+                row += 2
             continue
         for index, run in enumerate(ordered):
             older = ordered[index + 1] if index + 1 < len(ordered) else None
@@ -854,17 +995,113 @@ def _write_history(wb: Workbook, runs: list[DashboardRun]) -> None:
     ws.sheet_state = "hidden"
 
 
-def write_dashboard(output_path: Path, runs: list[DashboardRun]) -> Path:
+def _best_in_group(runs: list[DashboardRun]) -> DashboardRun:
+    """Newest SDK in the report week; pipeline weekday breaks ties for the same SDK."""
+    return max(
+        runs,
+        key=lambda run: (
+            _sdk_value(run),
+            _weekly_run_rank(run),
+            run.jenkins_run,
+        ),
+    )
+
+
+def _keep_completed(
+    runs: list[DashboardRun],
+    limit: int = HISTORY_LIMIT,
+    *,
+    weekly_schedule: bool = False,
+    report_week: ReportWeekConfig | None = None,
+) -> list[DashboardRun]:
+    """Triage Complete rows for the weekly workbook (up to `limit` report weeks)."""
+    cfg = report_week or ReportWeekConfig()
+    grouped: dict[tuple[str, str, str], list[DashboardRun]] = {}
+    for run in runs:
+        if not _is_complete(run):
+            continue
+        grouped.setdefault((run.release, run.stack, run.test_type), []).append(run)
+    kept: list[DashboardRun] = []
+
+    def _dedupe_by_sdk(items: list[DashboardRun]) -> list[DashboardRun]:
+        deduped: dict[str, DashboardRun] = {}
+        for run in items:
+            key = str(run.sdk_build)
+            prev = deduped.get(key)
+            deduped[key] = run if prev is None else _best_in_group([run, prev])
+        return sorted(deduped.values(), key=_sdk_value, reverse=True)
+
+    for (_release, _stack, test_type), group in grouped.items():
+        if weekly_schedule and test_type in WEEKLY_SCHEDULED_TYPES:
+            pipeline = [
+                run
+                for run in group
+                if include_run_for_dashboard(
+                    run.test_type, run.triggered, weekly_schedule=True
+                )
+            ]
+            selected = _dedupe_by_sdk(pipeline)[: WEEKLY_SCHEDULED_COMPLETE_LIMIT]
+            seen = {str(run.sdk_build) for run in selected}
+            if len(selected) < WEEKLY_SCHEDULED_COMPLETE_LIMIT:
+                for run in _dedupe_by_sdk(group):
+                    sdk = str(run.sdk_build)
+                    if sdk in seen:
+                        continue
+                    selected.append(run)
+                    seen.add(sdk)
+                    if len(selected) >= WEEKLY_SCHEDULED_COMPLETE_LIMIT:
+                        break
+            kept.extend(selected)
+            continue
+        if weekly_schedule and test_type in WEEKLY_SMOKE_REPORT_WEEKS:
+            smoke_runs = [
+                run for run in group
+                if include_run_for_dashboard(
+                    run.test_type, run.triggered, weekly_schedule=False
+                )
+            ]
+            by_week: dict[datetime, list[DashboardRun]] = {}
+            for run in smoke_runs:
+                week = report_week_start_for_triggered(run.triggered, cfg)
+                if week is None:
+                    continue
+                by_week.setdefault(week, []).append(run)
+            for week in sorted(by_week, reverse=True)[:limit]:
+                kept.append(_best_in_group(by_week[week]))
+            continue
+        group.sort(key=_sdk_value, reverse=True)
+        kept.extend(group[:limit])
+    return kept
+
+
+def write_dashboard(
+    output_path: Path,
+    runs: list[DashboardRun],
+    *,
+    completed_only: bool = False,
+    report_week: ReportWeekConfig | None = None,
+) -> Path:
     """Merge these runs into the workbook and rewrite the visible sheets."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    merged = _merge(_load_runs(output_path), runs)
+    merged = _merge(
+        _load_runs(output_path),
+        runs,
+        limit=40 if completed_only else HISTORY_LIMIT,
+        weekly_schedule=completed_only,
+    )
+    if completed_only:
+        merged = _keep_completed(
+            merged, weekly_schedule=True, report_week=report_week
+        )
     wb = Workbook()
     default = wb.active
     wb.remove(default)
-    owner_cells = _write_main(wb, merged)
+    owner_cells = _write_main(
+        wb, merged, completed_only=completed_only, report_week=report_week
+    )
     for test_type in TEST_TYPES:
-        _write_progress(wb, merged, test_type, owner_cells)
+        _write_progress(wb, merged, test_type, owner_cells, completed_only=completed_only)
     _write_history(wb, merged)
     wb.save(output_path)
     return output_path

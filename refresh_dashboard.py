@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -32,28 +33,46 @@ def _load_dotenv(path: Path) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Refresh the RAIL Excel dashboard.")
+    parser.add_argument(
+        "--weekly",
+        action="store_true",
+        help="Write RAIL-dashboard-weekly.xlsx with Triage Complete builds only.",
+    )
+    args = parser.parse_args()
     _load_dotenv(ROOT / ".env")
     from src.config import load_config
-    from src.dashboard_sync import refresh_dashboard
+    from src.dashboard_sync import refresh_dashboard, refresh_dashboard_weekly
     from src.jenkins_client import JenkinsError
 
     config = load_config()
     print("=== Configuration ===")
     for line in config.summary_lines():
         print(line)
-    if not config.dashboard_excel:
-        print("Config error: dashboard_excel is not set", file=sys.stderr)
+    target = config.dashboard_weekly_excel if args.weekly else config.dashboard_excel
+    if not target:
+        name = "dashboard_weekly_excel" if args.weekly else "dashboard_excel"
+        print(f"Config error: {name} is not set", file=sys.stderr)
         return 1
-    print("=== Refreshing dashboard ===")
-    try:
-        path = refresh_dashboard(config)
-    except PermissionError:
-        targets = [str(config.dashboard_excel)]
-        if config.dashboard_smoke_excel:
-            targets.append(str(config.dashboard_smoke_excel))
+    if args.weekly:
+        from src.report_week import format_report_week, report_week_start
+
+        start = report_week_start(cfg=config.report_week)
         print(
-            "An Excel file is open. Close it, then run this again:\n  "
-            + "\n  ".join(targets),
+            "=== Refreshing weekly dashboard ===",
+            f"(report week {format_report_week(start, config.report_week)})",
+            flush=True,
+        )
+    else:
+        print("=== Refreshing dashboard ===", flush=True)
+    try:
+        path = (
+            refresh_dashboard_weekly(config) if args.weekly else refresh_dashboard(config)
+        )
+    except PermissionError:
+        print(
+            "The Excel file is open. Close it, then run this again:\n"
+            f"  {target}",
             file=sys.stderr,
         )
         return 1
@@ -61,8 +80,6 @@ def main() -> int:
         print(f"Jenkins error: {exc}", file=sys.stderr)
         return 1
     print(f"Workbook: {path}")
-    if config.dashboard_smoke_excel:
-        print(f"Smoke workbook: {config.dashboard_smoke_excel}")
     return 0
 
 

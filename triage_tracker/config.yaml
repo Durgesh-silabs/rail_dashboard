@@ -1,0 +1,41 @@
+# Triage effort tracker (separate from RAIL-dashboard refresh).
+# Tabs: Week 1, Week 2, … (Wed–Wed report week shown in row 1).
+
+# Shared OneDrive copy — team opens this path (or Excel web); enable AutoSave for live sync.
+workbook: C:/Users/YOUR_USER/OneDrive - Silicon Laboratories Inc/RAIL-dashboard/RAIL-triage-effort.xlsx
+
+report_week:
+  weekday: wednesday
+  hour: 0
+  minute: 0
+
+# Week 1 = report week that contains week_1_start. At least min_tabs sheets are created.
+week_tabs:
+  min_tabs: 10
+  week_1_start: 2026-11-05
+
+engineers:
+  rail:
+    - Ankita
+    - Adithya
+    - SVN
+  rail_sdk:
+    - Durgesh
+    - Vijay
+    - Sai Krishna
+
+# No daily smoke rows on the weekly tab for these engineers.
+no_smoke_engineers:
+  - Ankita
+  - SVN
+
+# Rows created per engineer on each new week tab.
+weekly_tasks_per_engineer:
+  - pipeline: smoke
+    count: 5
+  - pipeline: regression
+    count: 1
+  - pipeline: ext_smoke
+    count: 1
+  - pipeline: ext_regression
+    count: 1

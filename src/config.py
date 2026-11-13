@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .report_week import ReportWeekConfig
+
 
 @dataclass(frozen=True)
 class DashboardJob:
@@ -28,11 +30,13 @@ class DashboardSource:
 class AppConfig:
     dashboard_excel: Path | None = None
     dashboard_smoke_excel: Path | None = None
+    dashboard_weekly_excel: Path | None = None
     dashboard_root: str = ""
     dashboard_stacks: tuple[str, ...] = ()
     dashboard_test_types: tuple[str, ...] = ()
     dashboard_sources: tuple[DashboardSource, ...] = ()
     source_path: Path | None = None
+    report_week: ReportWeekConfig = ReportWeekConfig()
 
     def resolved_dashboard_sources(self) -> tuple[DashboardSource, ...]:
         if self.dashboard_sources:
@@ -52,7 +56,7 @@ class AppConfig:
         return [
             f"config source:     {self.source_path or '-'}",
             f"dashboard_excel:   {self.dashboard_excel or '-'}",
-            f"dashboard_smoke:   {self.dashboard_smoke_excel or '-'}",
+            f"dashboard_weekly:  {self.dashboard_weekly_excel or '-'}",
             f"dashboard_root:    {self.dashboard_root or '-'}",
             f"dashboard_stacks:  {', '.join(self.dashboard_stacks) or '-'}",
             f"dashboard_types:   {', '.join(self.dashboard_test_types) or '-'}",
@@ -61,6 +65,7 @@ class AppConfig:
                 ", ".join(source.label for source in self.resolved_dashboard_sources())
                 or "-"
             ),
+            f"report_week:       {self.report_week.label()} (Wed–Wed cycles)",
         ]
 
 
@@ -131,9 +136,11 @@ def load_config(path: Path | None = None) -> AppConfig:
     return AppConfig(
         dashboard_excel=_as_path(raw.get("dashboard_excel")),
         dashboard_smoke_excel=_as_path(raw.get("dashboard_smoke_excel")),
+        dashboard_weekly_excel=_as_path(raw.get("dashboard_weekly_excel")),
         dashboard_root=str(raw.get("dashboard_root") or "").strip(),
         dashboard_stacks=_as_str_tuple(raw.get("dashboard_stacks")),
         dashboard_test_types=_as_str_tuple(raw.get("dashboard_test_types")),
         dashboard_sources=_as_sources(raw.get("dashboard_sources")),
         source_path=source,
+        report_week=ReportWeekConfig.from_mapping(raw.get("report_week")),
     )

@@ -1,8 +1,14 @@
 # RAIL dashboard refresh settings.
 
-dashboard_excel: C:/Users/ada/OneDrive - Silicon Laboratories Inc/Triage/RAIL-dashboard.xlsx
-# Smoke keeps last 5 builds; other test types keep the latest Triage Complete only.
-dashboard_smoke_excel: C:/Users/ada/OneDrive - Silicon Laboratories Inc/Triage/RAIL-dashboard-smoke.xlsx
+# Weekly workbook: one row per Wed–Wed report week. Auto-refresh: daily 11:00 (register_daily_task.cmd).
+report_week:
+  weekday: wednesday
+  hour: 11
+  minute: 0
+
+# Replace YOUR_USER and folder with your OneDrive path (see README).
+dashboard_excel: C:/Users/YOUR_USER/OneDrive - Silicon Laboratories Inc/RAIL-dashboard/RAIL-dashboard.xlsx
+dashboard_weekly_excel: C:/Users/YOUR_USER/OneDrive - Silicon Laboratories Inc/RAIL-dashboard/RAIL-dashboard-weekly.xlsx
 dashboard_root: https://jenkins-cbs-sqa.silabs.net/job/2026.12-package-manager-sqa-pipelines/
 dashboard_stacks:
   - rail
